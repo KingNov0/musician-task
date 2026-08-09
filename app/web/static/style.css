@@ -371,6 +371,13 @@ body {
   margin-right: 6px;
 }
 
+.debug-shot-link {
+  display: inline-block;
+  margin-left: 6px;
+  color: #7ab7ff;
+  text-decoration: underline;
+}
+
 .qr-box {
   text-align: center;
   padding: 14px;

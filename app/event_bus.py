@@ -68,6 +68,18 @@ class EventBus:
         # 记录到对应账号的缓冲区（log / qrcode / status 都留痕）
         acc = payload.get("account_id")
         if acc is not None:
+            # 二维码包含大块 data URL 且具有时效性，不落库；执行日志和状态持久化。
+            if event_type in {"log", "status"}:
+                try:
+                    from app import repository as repo
+
+                    if event_type == "log":
+                        repo.add_log(int(acc), "runtime", str(payload.get("level") or "info"), str(payload.get("line") or ""))
+                    else:
+                        repo.add_log(int(acc), "status", str(payload.get("status") or "info"), str(payload.get("detail") or ""))
+                except Exception:
+                    # 日志持久化失败不能中断浏览器任务和 WebSocket 广播。
+                    pass
             with self._buf_lock:
                 self._buffers[acc].append(msg)
                 if event_type == "qrcode":

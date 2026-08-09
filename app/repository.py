@@ -80,13 +80,16 @@ def create_account(
     run_time: Optional[str] = None,
     interval_days: Optional[int] = None,
     enabled: bool = True,
+    account_role: str = "musician",
 ) -> int:
     profile_dir = os.path.join(PROFILE_BASEDIR, _safe_phone(phone))
     with db() as conn:
         cur = conn.execute(
-            "INSERT INTO accounts(phone, password, profile_dir, enabled, run_time, interval_days) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (phone, password, profile_dir, 1 if enabled else 0, run_time, interval_days),
+            "INSERT INTO accounts(phone, password, profile_dir, enabled, run_time, interval_days, "
+            "account_role, daily_tasks_enabled, local_listen_enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (phone, password, profile_dir, 1 if enabled else 0, run_time, interval_days,
+             account_role, 1 if account_role == "musician" else 0,
+             1 if account_role == "player" else 0),
         )
         return int(cur.lastrowid)
 
@@ -96,8 +99,11 @@ def update_account(account_id: int, **fields) -> None:
         return
     allowed = {
         "phone", "password", "uid", "nickname", "profile_dir", "enabled",
+        "daily_tasks_enabled",
+        "account_role",
         "run_time", "interval_days", "cookie_status", "last_login_at",
         "further_vip_get_time", "last_send_date", "monthly_sends", "month_tag",
+        "local_listen_enabled", "local_listen_item_id",
     }
     sets, vals = [], []
     for k, v in fields.items():
@@ -129,6 +135,7 @@ def add_log(account_id: Optional[int], task_type: str, status: str, message: str
 
 
 def list_logs(account_id: Optional[int] = None, limit: int = 100) -> list[dict[str, Any]]:
+    limit = max(1, min(int(limit), 2000))
     with db() as conn:
         if account_id is not None:
             rows = conn.execute(
@@ -140,3 +147,91 @@ def list_logs(account_id: Optional[int] = None, limit: int = 100) -> list[dict[s
                 "SELECT * FROM task_logs ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(r) for r in rows]
+
+
+def cleanup_logs(retention_days: int) -> int:
+    """删除超过保留天数的任务和实时执行日志，返回删除条数。"""
+    days = max(1, int(retention_days))
+    with db() as conn:
+        cur = conn.execute(
+            "DELETE FROM task_logs WHERE created_at < datetime('now','localtime', ?)",
+            (f"-{days} days",),
+        )
+        return int(cur.rowcount or 0)
+
+
+# ---------- 本地账号互助听歌 ----------
+def count_local_listen_successes(account_id: int, *, period: str, as_target: bool = False) -> int:
+    column = "target_account_id" if as_target else "listener_account_id"
+    if period == "today":
+        where = "date(created_at)=date('now','localtime')"
+    elif period == "month":
+        where = "strftime('%Y-%m',created_at)=strftime('%Y-%m','now','localtime')"
+    else:
+        raise ValueError("period must be today or month")
+    with db() as conn:
+        row = conn.execute(
+            f"SELECT COUNT(*) AS n FROM local_listen_runs WHERE {column}=? AND status='success' AND {where}",
+            (account_id,),
+        ).fetchone()
+        return int(row["n"] or 0)
+
+
+def list_local_listen_targets(listener_account_id: int) -> list[dict[str, Any]]:
+    """列出其他本地参与账号；今日被听较少者优先。"""
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT a.*,
+                   COUNT(r.id) AS received_today
+            FROM accounts a
+            LEFT JOIN local_listen_runs r
+              ON r.target_account_id=a.id
+             AND r.status='success'
+             AND date(r.created_at)=date('now','localtime')
+            WHERE a.id<>?
+              AND a.enabled=1
+              AND a.account_role='musician'
+              AND a.local_listen_enabled=1
+              AND COALESCE(TRIM(a.local_listen_item_id),'')<>''
+            GROUP BY a.id
+            ORDER BY received_today ASC, a.id ASC
+            """,
+            (listener_account_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def next_local_listen_target(listener_account_id: int) -> Optional[dict[str, Any]]:
+    targets = list_local_listen_targets(listener_account_id)
+    return targets[0] if targets else None
+
+
+def local_listen_item_success_counts(target_account_id: int) -> dict[str, int]:
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT target_item_id, COUNT(*) AS n
+            FROM local_listen_runs
+            WHERE target_account_id=? AND status='success'
+              AND date(created_at)=date('now','localtime')
+            GROUP BY target_item_id
+            """,
+            (target_account_id,),
+        ).fetchall()
+        return {str(row["target_item_id"]): int(row["n"] or 0) for row in rows}
+
+
+def add_local_listen_run(
+    listener_account_id: int,
+    target_account_id: int,
+    target_item_id: str,
+    status: str,
+    message: str = "",
+) -> None:
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO local_listen_runs(listener_account_id,target_account_id,target_item_id,status,message) "
+            "VALUES (?,?,?,?,?)",
+            (listener_account_id, target_account_id, target_item_id, status, message[:2000]),
+        )

@@ -37,6 +37,7 @@
               <th class="ta-c">状态</th>
               <th class="ta-c">运行时间</th>
               <th class="ta-c">本月发布</th>
+              <th class="ta-c">本地互助（今日）</th>
               <th class="ta-r">操作</th>
             </tr>
           </thead>
@@ -62,6 +63,13 @@
           >密码 <input id="in-password" type="password" placeholder="密码"
         /></label>
         <label>运行时间 <input id="in-runtime" type="time" /></label>
+        <label
+          >账号角色
+          <select id="in-account-role">
+            <option value="musician">音乐人账号（执行音乐人任务，可被互助）</option>
+            <option value="player">普通播放账号（只帮助其他音乐人播放）</option>
+          </select>
+        </label>
         <div class="modal-actions">
           <button class="btn" data-close>取消</button>
           <button class="btn btn-primary" id="btn-save-add">保存并登录</button>
@@ -89,6 +97,22 @@
         <label class="row"
           ><input id="edit-enabled" type="checkbox" /> 启用</label
         >
+        <label
+          >账号角色
+          <select id="edit-account-role">
+            <option value="musician">音乐人账号（执行音乐人任务，可被互助）</option>
+            <option value="player">普通播放账号（只帮助其他音乐人播放）</option>
+          </select>
+        </label>
+        <div class="section-title">本地账号互助听歌</div>
+        <label class="row"
+          ><input id="edit-local-listen-enabled" type="checkbox" /> 加入本机账号互助</label
+        >
+        <label
+          >我的歌曲/专辑 ID（可填写多个）
+          <textarea id="edit-local-listen-item" rows="3" placeholder="多个 ID 用逗号、空格或换行分隔；专辑填 album:数字ID"></textarea>
+        </label>
+        <p class="hint-text">普通播放账号会自动加入本地互助，只负责播放音乐人目标；其歌曲 ID 不会进入待播放池。</p>
         <div class="modal-actions">
           <button class="btn" data-close>取消</button>
           <button class="btn btn-primary" id="btn-save-edit">保存</button>
@@ -106,6 +130,15 @@
         <label>默认运行时间 <input id="set-send-time" type="time" /></label>
         <label>执行间隔天数 <input id="set-interval" type="number" /></label>
         <label>每月最大发布 <input id="set-max-sends" type="number" /></label>
+        <div class="section-title">本地账号互助听歌</div>
+        <label>每日开始时间 <input id="set-local-listen-time" type="time" /></label>
+        <label>每账号每日最多帮助 <input id="set-local-listen-daily" type="number" min="0" /></label>
+        <label>每账号每月最多帮助 <input id="set-local-listen-monthly" type="number" min="0" /></label>
+        <label>每首播放比例 <input id="set-local-listen-percent" type="number" min="34" max="100" /> %</label>
+        <p class="hint-text">范围 34%～100%；达到设置比例后额外播放 5 秒，最多播放到歌曲结束。</p>
+        <div class="section-title">历史日志</div>
+        <label>日志保留天数 <input id="set-log-retention" type="number" min="1" max="3650" /></label>
+        <p class="hint-text">执行详情保存在本机 SQLite，每天自动清理超过保留期的记录。</p>
         <label class="row"
           ><input id="set-headless" type="checkbox" /> 无头模式（服务器）</label
         >
@@ -187,7 +220,7 @@
         </div>
         <input id="run-account-id" type="hidden" />
         <p class="confirm-text">
-          选择要执行的任务（在同一浏览器会话内依次完成）：
+          选择要执行的任务（本地互助听歌会在其他任务完成后执行）：
         </p>
         <label class="row"
           ><input type="checkbox" class="run-task" value="checkin" checked />
@@ -200,6 +233,9 @@
         <label class="row"
           ><input type="checkbox" class="run-task" value="vip" /> 领取 VIP
           权益</label
+        >
+        <label class="row"
+          ><input type="checkbox" class="run-task" value="local_listen" /> 本地互助听歌</label
         >
         <p class="hint-text">
           提示：发布动态与领取 VIP 同时勾选时，本次优先执行 VIP。
@@ -248,6 +284,7 @@
         <div id="log-box" class="log-box"></div>
         <div class="modal-actions">
           <button class="btn btn-danger" id="btn-force-stop">强制停止</button>
+          <button class="btn" id="btn-refresh-log">刷新历史</button>
           <button class="btn" id="btn-clear-log">清空</button>
           <button class="btn" data-close>关闭</button>
         </div>

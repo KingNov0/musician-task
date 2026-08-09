@@ -10,3 +10,5 @@ test/
 .env
 .vscode
 app/data/
+.DS_store
+*/.DS_store

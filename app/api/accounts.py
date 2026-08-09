@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from app import repository as repo
 from app.logging_conf import logger
 from app.account_identity import account_label
+from app.local_listen import normalize_item_ids
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 
@@ -20,6 +21,7 @@ class AccountCreate(BaseModel):
     run_time: str | None = None
     interval_days: int | None = None
     enabled: bool = True
+    account_role: str = "musician"
 
 
 class AccountUpdate(BaseModel):
@@ -27,12 +29,20 @@ class AccountUpdate(BaseModel):
     run_time: str | None = None
     interval_days: int | None = None
     enabled: bool | None = None
+    account_role: str | None = None
+    local_listen_enabled: bool | None = None
+    local_listen_item_id: str | None = None
 
 
 def _safe(acc: dict) -> dict:
     """对外隐藏密码。"""
     out = dict(acc)
     out.pop("password", None)
+    account_id = int(out["id"])
+    out["local_listen_helped_today"] = repo.count_local_listen_successes(account_id, period="today")
+    out["local_listen_received_today"] = repo.count_local_listen_successes(
+        account_id, period="today", as_target=True
+    )
     return out
 
 
@@ -53,12 +63,15 @@ def get_account(account_id: int) -> dict:
 def create_account(body: AccountCreate) -> dict:
     if repo.get_account_by_phone(body.phone):
         raise HTTPException(400, "该手机号已存在")
+    if body.account_role not in {"musician", "player"}:
+        raise HTTPException(422, "账号角色必须是 musician 或 player")
     account_id = repo.create_account(
         body.phone,
         body.password,
         run_time=body.run_time,
         interval_days=body.interval_days,
         enabled=body.enabled,
+        account_role=body.account_role,
     )
     _reschedule()
     return _safe(repo.get_account(account_id))
@@ -69,8 +82,23 @@ def update_account(account_id: int, body: AccountUpdate) -> dict:
     if not repo.get_account(account_id):
         raise HTTPException(404, "账号不存在")
     fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    if "account_role" in fields:
+        role = fields["account_role"]
+        if role not in {"musician", "player"}:
+            raise HTTPException(422, "账号角色必须是 musician 或 player")
+        fields["daily_tasks_enabled"] = 1 if role == "musician" else 0
     if "enabled" in fields:
         fields["enabled"] = 1 if fields["enabled"] else 0
+    if "local_listen_enabled" in fields:
+        fields["local_listen_enabled"] = 1 if fields["local_listen_enabled"] else 0
+    if "local_listen_item_id" in fields:
+        try:
+            fields["local_listen_item_id"] = normalize_item_ids(fields["local_listen_item_id"])
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    if fields.get("account_role") == "player":
+        fields["daily_tasks_enabled"] = 0
+        fields["local_listen_enabled"] = 1
     repo.update_account(account_id, **fields)
     _reschedule()
     return _safe(repo.get_account(account_id))

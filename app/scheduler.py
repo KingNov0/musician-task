@@ -11,7 +11,7 @@ from apscheduler.triggers.cron import CronTrigger
 from app import repository as repo
 from app.logging_conf import logger
 from app.account_identity import account_label
-from app.runner import run_daily_for_account
+from app.runner import run_daily_for_account, run_auto_local_listen_for_account
 
 scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
 
@@ -29,26 +29,59 @@ def _job_id(account_id: int) -> str:
     return f"daily_account_{account_id}"
 
 
+def _listen_job_id(account_id: int) -> str:
+    return f"local_listen_account_{account_id}"
+
+
+def cleanup_expired_logs() -> None:
+    days = repo.get_setting_int("log_retention_days", 3)
+    deleted = repo.cleanup_logs(days)
+    if deleted:
+        logger.info(f"已清理 {deleted} 条超过 {days} 天的历史日志")
+
+
 def reschedule_all() -> None:
     """清空并按当前账号配置重建所有 job。"""
     for job in scheduler.get_jobs():
         job.remove()
 
+    scheduler.add_job(
+        cleanup_expired_logs,
+        trigger=CronTrigger(hour=3, minute=15),
+        id="cleanup_expired_logs",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    cleanup_expired_logs()
+
     default_time = repo.get_setting("default_send_time", "09:30") or "09:30"
     for acc in repo.list_accounts():
         if not acc["enabled"]:
             continue
-        run_time = acc["run_time"] or default_time
-        h, m = _parse_hhmm(run_time, default_time)
-        scheduler.add_job(
-            run_daily_for_account,
-            trigger=CronTrigger(hour=h, minute=m),
-            args=[acc["id"]],
-            id=_job_id(acc["id"]),
-            replace_existing=True,
-            misfire_grace_time=3600,
-        )
-        logger.info(f"已排程账号 {account_label(acc['id'], account=acc)} 每日任务：{run_time}")
+        if acc.get("account_role", "musician") == "musician":
+            run_time = acc["run_time"] or default_time
+            h, m = _parse_hhmm(run_time, default_time)
+            scheduler.add_job(
+                run_daily_for_account,
+                trigger=CronTrigger(hour=h, minute=m),
+                args=[acc["id"]],
+                id=_job_id(acc["id"]),
+                replace_existing=True,
+                misfire_grace_time=3600,
+            )
+            logger.info(f"已排程账号 {account_label(acc['id'], account=acc)} 每日任务：{run_time}")
+        if acc.get("local_listen_enabled"):
+            listen_time = repo.get_setting("local_listen_start_time", "09:30") or "09:30"
+            lh, lm = _parse_hhmm(listen_time, "09:30")
+            scheduler.add_job(
+                run_auto_local_listen_for_account,
+                trigger=CronTrigger(hour=lh, minute=lm),
+                args=[acc["id"]],
+                id=_listen_job_id(acc["id"]),
+                replace_existing=True,
+                misfire_grace_time=3600,
+            )
+            logger.info(f"已排程账号 {account_label(acc['id'], account=acc)} 本地互助听歌：{listen_time}")
 
 
 def start() -> None:

@@ -135,6 +135,202 @@ def do_checkin(profile_dir: str, account_id: Optional[int] = None) -> dict:
         return res
 
 
+# ---------- 本地账号互助听歌 ----------
+def _read_playback_state(page: Page) -> dict[str, float | str]:
+    """从主页面或 iframe 中读取播放器进度，单位统一为毫秒。"""
+    script = """
+        () => {
+            const p = window.player;
+            try {
+                if (p && typeof p.getDuration === 'function' && p.getDuration() > 0) {
+                    let cur = Number(p.getPosition ? p.getPosition() : 0);
+                    let dur = Number(p.getDuration());
+                    if (dur < 10000) { cur *= 1000; dur *= 1000; }
+                    return {cur, dur, state: String(p.getState ? p.getState() : '')};
+                }
+            } catch (e) {}
+            const audio = document.querySelector('audio');
+            if (!audio) return {cur: 0, dur: 0, state: ''};
+            return {
+                cur: Number.isFinite(audio.currentTime) ? Math.max(0, audio.currentTime * 1000) : 0,
+                dur: Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration * 1000 : 0,
+                state: audio.paused ? 'paused' : 'playing',
+            };
+        }
+    """
+    for frame in page.frames:
+        try:
+            state = frame.evaluate(script)
+            if state and (float(state.get("dur", 0)) > 0 or state.get("state")):
+                return state
+        except Exception:
+            continue
+
+    dom_script = """
+        () => {
+            const toMs = (value) => {
+                const parts = String(value || '').trim().split(':').map(Number);
+                if (parts.length !== 2 || parts.some(Number.isNaN)) return 0;
+                return (parts[0] * 60 + parts[1]) * 1000;
+            };
+            for (const node of document.querySelectorAll('.m-playbar .time, .g-btmbar .time, .m-pbar .time')) {
+                const text = (node.innerText || node.textContent || '').trim();
+                const match = text.match(/(\\d{1,3}:\\d{2})\\s*\\/\\s*(\\d{1,3}:\\d{2})/);
+                if (match) return {cur: toMs(match[1]), dur: toMs(match[2]), state: ''};
+            }
+            return {cur: 0, dur: 0, state: ''};
+        }
+    """
+    for frame in page.frames:
+        try:
+            state = frame.evaluate(dom_script)
+            if state and float(state.get("dur", 0)) > 0:
+                return state
+        except Exception:
+            continue
+    return {"cur": 0, "dur": 0, "state": ""}
+
+
+def _click_play_controls(page: Page, *, force: bool = False) -> bool:
+    if not force and _read_playback_state(page).get("state") not in {"paused", "stop"}:
+        return False
+    for scope in scopes(page):
+        for selector in [
+            ".m-playbar .ply", ".g-btmbar .ply", ".u-btni-play",
+            '[data-res-action="play"]', "#playall", ".u-btn2-2",
+        ]:
+            try:
+                loc = scope.locator(selector)
+                if loc.count() > 0 and loc.first.is_visible():
+                    loc.first.click(timeout=1500)
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _listen_item_on_page(
+    page: Page,
+    netease_item_id: str,
+    account_id: Optional[int],
+    timeout_seconds: int,
+    play_percent: int,
+) -> dict:
+    """播放到配置比例并额外保留 5 秒后返回成功。"""
+    item_id = str(netease_item_id or "").strip()
+    item_kind, target_id = "song", item_id
+    if item_id.startswith("album:"):
+        item_kind, target_id = "album", item_id[6:].strip()
+    if not target_id.isdigit():
+        return {"ok": False, "message": f"无效的歌曲/专辑 ID：{item_id}"}
+
+    page.goto(f"https://music.163.com/#/{item_kind}?id={target_id}", wait_until="domcontentloaded")
+    page.wait_for_timeout(3000)
+    if not _click_play_controls(page, force=True):
+        return {"ok": False, "item_id": item_id, "message": "未找到可用的播放按钮"}
+
+    deadline = time.time() + timeout_seconds
+    last_log = 0.0
+    while time.time() < deadline:
+        from app.browser import registry
+
+        try:
+            page_closed = page.is_closed()
+        except Exception:
+            page_closed = True
+        if page_closed or not registry.is_current_task(account_id):
+            _emit(account_id, f"本地互助已停止：{item_id}", "warn")
+            return {"ok": False, "stopped": True, "item_id": item_id, "message": "任务已强制停止"}
+        state = _read_playback_state(page)
+        cur, dur = float(state.get("cur", 0)), float(state.get("dur", 0))
+        required_ms = min(dur, dur * max(34, min(100, play_percent)) / 100 + 5000) if dur > 0 else 0
+        if required_ms > 0 and cur >= required_ms:
+            _emit(account_id, f"本地互助计次完成：{item_id}（已播放 {cur / 1000:.0f}/{dur / 1000:.0f} 秒）")
+            return {"ok": True, "auth_valid": True, "item_id": item_id,
+                    "played_ms": int(cur), "duration_ms": int(dur)}
+        if state.get("state") in {"paused", "stop"}:
+            _click_play_controls(page)
+        if time.time() - last_log >= 15:
+            _emit(account_id, f"本地互助播放中：{item_id}，进度 {cur / 1000:.0f}/{dur / 1000:.0f} 秒")
+            last_log = time.time()
+        time.sleep(2)
+    return {"ok": False, "item_id": item_id, "message": "播放超时"}
+
+
+def do_listen_music_batch(
+    profile_dir: str,
+    netease_item_ids: list[str],
+    account_id: Optional[int] = None,
+    timeout_seconds: int = 1200,
+    play_percent: int = 34,
+) -> dict:
+    """一个浏览器上下文内连续新开标签页执行多首本地互助歌曲。"""
+    item_ids = [str(item).strip() for item in netease_item_ids if str(item).strip()]
+    if not item_ids:
+        return {"ok": False, "results": [], "message": "没有可播放的歌曲"}
+
+    bus.status(account_id, "running", f"本地互助批量播放：{len(item_ids)} 首")
+    results: list[dict] = []
+    with run_with_context(profile_dir, account_id=account_id, label="本地互助听歌") as (context, page):
+        if not _validate_session(page, account_id):
+            return {"ok": False, "auth_valid": False, "results": [], "message": "cookie expired"}
+        current_page = page
+        for index, item_id in enumerate(item_ids):
+            from app.browser import registry
+
+            if not registry.is_current_task(account_id):
+                results.append({"ok": False, "stopped": True, "item_id": item_id, "message": "任务已强制停止"})
+                break
+            if index > 0:
+                try:
+                    next_page = context.new_page()
+                except Exception as exc:  # noqa: BLE001
+                    stopped = not registry.is_current_task(account_id)
+                    results.append({"ok": False, "stopped": stopped, "item_id": item_id,
+                                    "message": "任务已强制停止" if stopped else str(exc)})
+                    break
+                try:
+                    current_page.close()
+                except Exception:
+                    pass
+                current_page = next_page
+            _emit(account_id, f"开始第 {index + 1}/{len(item_ids)} 首：{item_id}")
+            try:
+                result = _listen_item_on_page(
+                    current_page, item_id, account_id, timeout_seconds, play_percent
+                )
+            except Exception as exc:  # noqa: BLE001
+                stopped = not registry.is_current_task(account_id)
+                result = {"ok": False, "stopped": stopped, "item_id": item_id,
+                          "message": "任务已强制停止" if stopped else str(exc)}
+            results.append(result)
+            if result.get("stopped"):
+                break
+        success_count = sum(1 for result in results if result.get("ok"))
+    stopped = any(result.get("stopped") for result in results)
+    if not stopped:
+        bus.status(account_id, "done", f"本地互助完成：{success_count}/{len(item_ids)} 首")
+    return {"ok": success_count == len(item_ids), "auth_valid": True, "results": results,
+            "stopped": stopped,
+            "message": "任务已强制停止" if stopped else f"完成 {success_count}/{len(item_ids)} 首"}
+
+
+def do_listen_music(
+    profile_dir: str,
+    netease_item_id: str,
+    account_id: Optional[int] = None,
+    timeout_seconds: int = 1200,
+    play_percent: int = 34,
+) -> dict:
+    """兼容单首调用；实际复用批量浏览器会话实现。"""
+    batch = do_listen_music_batch(
+        profile_dir, [netease_item_id], account_id, timeout_seconds, play_percent
+    )
+    if batch.get("results"):
+        return batch["results"][0]
+    return batch
+
+
 # ---------- 每日整体流程（签到 +（可选）间隔任务，同一浏览器不关闭）----------
 def do_daily_run(
     profile_dir: str,

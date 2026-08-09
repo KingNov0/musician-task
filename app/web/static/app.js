@@ -35,18 +35,29 @@ function openRunModal(title, accountId) {
   $("#modal-run").classList.remove("hidden");
 }
 async function openViewModal(accountId, phone) {
-  // 查看：拉取累积日志（不清空），继续接收实时更新
-  openRunModal(`账号 ${phone || accountId} 运行日志`, accountId);
+  // 查看：从 SQLite 拉取历史日志，并继续接收实时更新。
+  openRunModal(`账号 ${phone || accountId} 历史日志`, accountId);
+  await loadHistoryLogs(accountId);
   try {
     const data = await api(`/api/tasks/${accountId}/live`);
-    for (const m of data.logs || []) {
-      if (m.type === "log") appendLog(m.ts, m.line, m.level);
-      else if (m.type === "status")
-        appendLog(m.ts, `【状态】${m.status} ${m.detail || ""}`, "info");
-    }
     if (data.qr && data.qr.qr_url) showQR(data.qr.qr_url, data.qr.tip);
   } catch (err) {
-    appendLog("", "拉取日志失败：" + err.message, "error");
+    appendLog("", "拉取当前状态失败：" + err.message, "error");
+  }
+}
+async function loadHistoryLogs(accountId) {
+  try {
+    const rows = await api(`/api/tasks/logs?account_id=${accountId}&limit=1000`);
+    $("#log-box").innerHTML = "";
+    for (const row of [...rows].reverse()) {
+      const prefix = row.task_type === "runtime"
+        ? ""
+        : `【${row.task_type || "task"}/${row.status || "info"}】`;
+      appendLog(row.created_at, `${prefix}${row.message || ""}`, row.status);
+    }
+    if (!rows.length) appendLog("", "暂无历史日志", "info");
+  } catch (err) {
+    appendLog("", "拉取历史日志失败：" + err.message, "error");
   }
 }
 function appendLog(ts, line, level) {
@@ -54,7 +65,19 @@ function appendLog(ts, line, level) {
   if (!box) return;
   const div = document.createElement("div");
   div.className = "log-line " + (level || "info");
-  div.innerHTML = `<span class="t">${ts || ""}</span>${escapeHtml(line)}`;
+  const value = String(line || "");
+  const screenshot = value.match(/\/api\/debug\/screenshots\/\d+\/[A-Za-z0-9_.-]+\.png/);
+  const text = screenshot ? value.replace(screenshot[0], "") : value;
+  div.innerHTML = `<span class="t">${ts || ""}</span>${escapeHtml(text)}`;
+  if (screenshot) {
+    const link = document.createElement("a");
+    link.href = screenshot[0];
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.className = "debug-shot-link";
+    link.textContent = "查看截图";
+    div.appendChild(link);
+  }
   box.appendChild(div);
   box.scrollTop = box.scrollHeight;
 }
@@ -129,10 +152,13 @@ async function loadAccounts() {
     const running = runningAccountId === a.id;
     const actionBtn = running
       ? `<button class="btn btn-sm btn-view" data-act="view" data-id="${a.id}" data-phone="${escapeHtml(a.phone)}">查看</button>`
-      : `<button class="btn btn-sm" data-act="run" data-id="${a.id}" data-phone="${escapeHtml(a.phone)}">执行</button>`;
+      : `<button class="btn btn-sm" data-act="run" data-id="${a.id}" data-phone="${escapeHtml(a.phone)}" data-role="${a.account_role || "musician"}">执行</button>`;
+    const historyBtn = running
+      ? ""
+      : `<button class="btn btn-sm" data-act="history" data-id="${a.id}" data-phone="${escapeHtml(a.phone)}">日志</button>`;
     const enabled = !!a.enabled;
     const enabledBadge = enabled
-      ? `<span class="badge ok">启用</span>`
+      ? `<span class="badge ok">启用</span> <span class="badge unknown">${a.account_role === "player" ? "普通播放" : "音乐人"}</span>`
       : `<span class="badge expired">暂停</span>`;
     const toggleBtn = `<button class="btn btn-sm" data-act="toggle" data-id="${a.id}" data-enabled="${enabled ? 1 : 0}">${enabled ? "暂停" : "启用"}</button>`;
     const tr = document.createElement("tr");
@@ -143,9 +169,11 @@ async function loadAccounts() {
       <td data-label="状态">${enabledBadge}</td>
       <td data-label="运行时间">${runTime}</td>
       <td data-label="本月发布">${a.monthly_sends || 0}</td>
+      <td data-label="本地互助（今日）">${a.local_listen_enabled ? `帮助 ${a.local_listen_helped_today || 0} / 被帮助 ${a.local_listen_received_today || 0}` : "未加入"}</td>
       <td data-label="操作" class="cell-actions">
         <button class="btn btn-sm btn-primary" data-act="login" data-id="${a.id}" data-phone="${escapeHtml(a.phone)}">登录</button>
         ${actionBtn}
+        ${historyBtn}
         ${toggleBtn}
         <button class="btn btn-sm" data-act="edit" data-id="${a.id}">编辑</button>
         <button class="btn btn-sm btn-danger" data-act="delete" data-id="${a.id}" data-phone="${escapeHtml(a.phone)}">删除</button>
@@ -182,7 +210,7 @@ $("#acc-body").addEventListener("click", async (e) => {
     if (act === "login") {
       openLoginConfirm(id, btn.dataset.phone);
     } else if (act === "run") {
-      openRunSelect(id, btn.dataset.phone);
+      openRunSelect(id, btn.dataset.phone, btn.dataset.role);
     } else if (act === "toggle") {
       const next = btn.dataset.enabled === "1" ? false : true;
       await api(`/api/accounts/${id}`, {
@@ -191,6 +219,8 @@ $("#acc-body").addEventListener("click", async (e) => {
       });
       await loadAccounts();
     } else if (act === "view") {
+      openViewModal(id, btn.dataset.phone);
+    } else if (act === "history") {
       openViewModal(id, btn.dataset.phone);
     } else if (act === "edit") {
       openEdit(id);
@@ -224,12 +254,13 @@ $("#btn-confirm-login").addEventListener("click", async () => {
 });
 
 // ---------- 执行任务多选 ----------
-function openRunSelect(id, phone) {
+function openRunSelect(id, phone, role = "musician") {
   $("#run-account-id").value = id;
   $("#run-account-id").dataset.phone = phone || `#${id}`;
-  document
-    .querySelectorAll(".run-task")
-    .forEach((c) => (c.checked = c.value === "checkin"));
+  document.querySelectorAll(".run-task").forEach((c) => {
+    c.disabled = role === "player" && c.value !== "local_listen";
+    c.checked = role === "player" ? c.value === "local_listen" : c.value === "checkin";
+  });
   $("#modal-run-select").classList.remove("hidden");
 }
 $("#btn-confirm-run").addEventListener("click", async () => {
@@ -290,12 +321,14 @@ $("#btn-add").addEventListener("click", () => {
   $("#in-phone").value = "";
   $("#in-password").value = "";
   $("#in-runtime").value = globalSendTime || "";
+  $("#in-account-role").value = "musician";
   $("#modal-add").classList.remove("hidden");
 });
 $("#btn-save-add").addEventListener("click", async () => {
   const phone = $("#in-phone").value.trim();
   const password = $("#in-password").value;
   const run_time = $("#in-runtime").value.trim() || null;
+  const account_role = $("#in-account-role").value;
   if (!phone || !password) {
     alert("请填写手机号和密码");
     return;
@@ -303,7 +336,7 @@ $("#btn-save-add").addEventListener("click", async () => {
   try {
     const acc = await api("/api/accounts", {
       method: "POST",
-      body: JSON.stringify({ phone, password, run_time }),
+      body: JSON.stringify({ phone, password, run_time, account_role }),
     });
     $("#modal-add").classList.add("hidden");
     openRunModal(`账号 ${phone} 登录中`, acc.id);
@@ -323,8 +356,19 @@ async function openEdit(id) {
   $("#edit-runtime").value = a.run_time || "";
   $("#edit-interval").value = a.interval_days || "";
   $("#edit-enabled").checked = !!a.enabled;
+  $("#edit-account-role").value = a.account_role || "musician";
+  $("#edit-local-listen-enabled").checked = !!a.local_listen_enabled;
+  $("#edit-local-listen-item").value = a.local_listen_item_id || "";
+  syncEditRoleUI();
   $("#modal-edit").classList.remove("hidden");
 }
+function syncEditRoleUI() {
+  const player = $("#edit-account-role").value === "player";
+  $("#edit-local-listen-enabled").disabled = player;
+  $("#edit-local-listen-item").disabled = player;
+  if (player) $("#edit-local-listen-enabled").checked = true;
+}
+$("#edit-account-role").addEventListener("change", syncEditRoleUI);
 $("#btn-save-edit").addEventListener("click", async () => {
   const id = $("#edit-id").value;
   const payload = {};
@@ -335,6 +379,9 @@ $("#btn-save-edit").addEventListener("click", async () => {
   if (rt) payload.run_time = rt;
   if (iv) payload.interval_days = parseInt(iv, 10);
   payload.enabled = $("#edit-enabled").checked;
+  payload.account_role = $("#edit-account-role").value;
+  payload.local_listen_enabled = $("#edit-local-listen-enabled").checked;
+  payload.local_listen_item_id = $("#edit-local-listen-item").value.trim();
   try {
     await api(`/api/accounts/${id}`, {
       method: "PATCH",
@@ -353,6 +400,11 @@ $("#btn-settings").addEventListener("click", async () => {
   $("#set-send-time").value = s.default_send_time || "";
   $("#set-interval").value = s.execution_interval_days || "";
   $("#set-max-sends").value = s.max_monthly_sends || "";
+  $("#set-local-listen-time").value = s.local_listen_start_time || "09:30";
+  $("#set-local-listen-daily").value = s.local_listen_daily_max || "25";
+  $("#set-local-listen-monthly").value = s.local_listen_monthly_max || "650";
+  $("#set-local-listen-percent").value = s.local_listen_play_percent || "34";
+  $("#set-log-retention").value = s.log_retention_days || "3";
   $("#set-headless").checked = s.headless === "1";
   $("#set-login-method").value = s.login_method || "auto";
   $("#set-wecom").value = s.wecom_webhook_key || "";
@@ -370,6 +422,11 @@ $("#btn-save-settings").addEventListener("click", async () => {
     default_send_time: $("#set-send-time").value.trim(),
     execution_interval_days: $("#set-interval").value.trim(),
     max_monthly_sends: $("#set-max-sends").value.trim(),
+    local_listen_start_time: $("#set-local-listen-time").value.trim(),
+    local_listen_daily_max: $("#set-local-listen-daily").value.trim(),
+    local_listen_monthly_max: $("#set-local-listen-monthly").value.trim(),
+    local_listen_play_percent: $("#set-local-listen-percent").value.trim(),
+    log_retention_days: $("#set-log-retention").value.trim(),
     headless: $("#set-headless").checked ? "1" : "0",
     login_method: $("#set-login-method").value,
     wecom_webhook_key: $("#set-wecom").value.trim(),
@@ -409,6 +466,10 @@ $("#btn-logout").addEventListener("click", async () => {
 
 $("#btn-clear-log").addEventListener("click", () => {
   $("#log-box").innerHTML = "";
+});
+$("#btn-refresh-log").addEventListener("click", async () => {
+  const id = $("#run-modal-account").value;
+  if (id) await loadHistoryLogs(id);
 });
 
 // ---------- 强制停止 ----------

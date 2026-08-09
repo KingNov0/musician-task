@@ -18,12 +18,13 @@ from app.logging_conf import logger
 
 
 class _Active:
-    __slots__ = ("pid", "account_id", "label")
+    __slots__ = ("pid", "account_id", "label", "thread_id")
 
     def __init__(self, pid: int, account_id: Optional[int], label: str):
         self.pid = pid
         self.account_id = account_id
         self.label = label
+        self.thread_id = threading.get_ident()
 
 
 _lock = threading.Lock()
@@ -105,6 +106,17 @@ def active_info() -> Optional[dict]:
         if _active is None:
             return None
         return {"account_id": _active.account_id, "label": _active.label, "pid": _active.pid}
+
+
+def is_current_task(account_id: Optional[int]) -> bool:
+    """当前调用线程是否仍是注册中的浏览器任务；强停或被抢占后立即为 False。"""
+    thread_id = threading.get_ident()
+    with _lock:
+        return (
+            _active is not None
+            and _active.thread_id == thread_id
+            and _active.account_id == account_id
+        )
 
 
 def force_stop(account_id: Optional[int] = None) -> bool:

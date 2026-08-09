@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     nickname            TEXT,
     profile_dir         TEXT,
     enabled             INTEGER NOT NULL DEFAULT 1,
+    daily_tasks_enabled INTEGER NOT NULL DEFAULT 1,
+    account_role        TEXT NOT NULL DEFAULT 'musician', -- musician / player
     run_time            TEXT,          -- HH:MM，空则用全局
     interval_days       INTEGER,       -- 空则用全局
     cookie_status       TEXT DEFAULT 'unknown',   -- ok / expired / unknown
@@ -24,6 +26,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     last_send_date      TEXT,          -- YYYY-MM-DD
     monthly_sends       INTEGER NOT NULL DEFAULT 0,
     month_tag           TEXT,          -- YYYY-MM，用于月度计数归零
+    local_listen_enabled INTEGER NOT NULL DEFAULT 0,
+    local_listen_item_id TEXT,
     created_at          TEXT DEFAULT (datetime('now','localtime')),
     updated_at          TEXT DEFAULT (datetime('now','localtime'))
 );
@@ -31,7 +35,7 @@ CREATE TABLE IF NOT EXISTS accounts (
 CREATE TABLE IF NOT EXISTS task_logs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id  INTEGER,
-    task_type   TEXT,       -- login / musician_checkin / daily_checkin / daily / publish / vip
+    task_type   TEXT,       -- login / musician_checkin / daily_checkin / daily / publish / vip / local_listen
     status      TEXT,       -- success / fail / info
     message     TEXT,
     created_at  TEXT DEFAULT (datetime('now','localtime'))
@@ -42,7 +46,20 @@ CREATE TABLE IF NOT EXISTS settings (
     value   TEXT
 );
 
+CREATE TABLE IF NOT EXISTS local_listen_runs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    listener_account_id INTEGER NOT NULL,
+    target_account_id   INTEGER NOT NULL,
+    target_item_id      TEXT NOT NULL,
+    status              TEXT NOT NULL,
+    message             TEXT,
+    created_at          TEXT DEFAULT (datetime('now','localtime'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_task_logs_account ON task_logs(account_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_task_logs_created ON task_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_local_listen_listener ON local_listen_runs(listener_account_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_local_listen_target ON local_listen_runs(target_account_id, created_at);
 """
 
 
@@ -68,6 +85,15 @@ def init_db() -> None:
     """建表并播种全局 settings（仅首次）。"""
     with db() as conn:
         conn.executescript(SCHEMA)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(accounts)").fetchall()}
+        if "local_listen_enabled" not in columns:
+            conn.execute("ALTER TABLE accounts ADD COLUMN local_listen_enabled INTEGER NOT NULL DEFAULT 0")
+        if "local_listen_item_id" not in columns:
+            conn.execute("ALTER TABLE accounts ADD COLUMN local_listen_item_id TEXT")
+        if "daily_tasks_enabled" not in columns:
+            conn.execute("ALTER TABLE accounts ADD COLUMN daily_tasks_enabled INTEGER NOT NULL DEFAULT 1")
+        if "account_role" not in columns:
+            conn.execute("ALTER TABLE accounts ADD COLUMN account_role TEXT NOT NULL DEFAULT 'musician'")
         for k, v in SETTINGS_SEED.items():
             conn.execute(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (k, v)
